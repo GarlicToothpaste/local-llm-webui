@@ -1,86 +1,100 @@
 import streamlit as st
 import os
-import time
-import requests
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from pathlib import Path
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# --- BULLETPROOF CONFIG ---
-WATCH_PATH = "./knowledge_base"
+# --- CONFIG ---
+WATCH_PATH = Path("./knowledge_base")  # Convert to Path object
 DB_PATH = "./chroma_db"
 MODEL_NAME = "qwen3:4b"  
 EMBED_MODEL = "nomic-embed-text:latest"
 
-os.makedirs(WATCH_PATH, exist_ok=True)
+# Create folder if it doesn't exist
+WATCH_PATH.mkdir(exist_ok=True)
 
 @st.cache_resource
 def setup_rag():
-    """Fresh Chroma setup every time"""
+    """Initialize embeddings and vector store"""
     embeddings = OllamaEmbeddings(model=EMBED_MODEL)
     
-    # Always fresh - no persist issues
     vectorstore = Chroma(
         persist_directory=str(DB_PATH),
-        embedding_function=embeddings
+        embedding_function=embeddings,
+        collection_name="documents"  # Named collection
     )
     
     llm = ChatOllama(model=MODEL_NAME, temperature=0.1)
     return vectorstore, llm
 
+# Load RAG components
 vectorstore, llm = setup_rag()
 
 def index_folder():
-    """Index ALL files in folder - manual verification"""
-    files = list(WATCH_PATH.glob("*.pdf")) + list(WATCH_PATH.glob("*.txt"))
+    """Index all PDF and TXT files in the knowledge base folder"""
+    # Get all PDF and TXT files using Path glob
+    pdf_files = list(WATCH_PATH.glob("*.pdf"))
+    txt_files = list(WATCH_PATH.glob("*.txt"))
+    files = pdf_files + txt_files
     
     if not files:
-        return "No PDF/TXT files found"
+        return "No PDF/TXT files found in ./knowledge_base/"
     
     total_chunks = 0
+    
     for file in files:
         try:
-            if file.suffix == '.pdf':
+            # Load documents based on file type
+            if file.suffix.lower() == '.pdf':
                 loader = PyPDFLoader(str(file))
             else:
                 loader = TextLoader(str(file))
             
             docs = loader.load()
-            splitter = RecursiveCharacterTextSplitter(chunk_size=800)
+            
+            if not docs:
+                continue
+            
+            # Split documents into chunks
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=800,
+                chunk_overlap=100
+            )
             chunks = splitter.split_documents(docs)
             
+            # Add to vector store
             vectorstore.add_documents(chunks)
             total_chunks += len(chunks)
             
         except Exception as e:
-            return f"Error {file.name}: {e}"
+            return f"Error processing {file.name}: {str(e)}"
     
     return f"✅ Indexed {len(files)} files → {total_chunks} chunks"
 
 def query_docs(question):
-    """Simple query with debug"""
-    # Count before search
-    count = vectorstore._collection.count()
-    st.caption(f"**DB size:** {count} chunks")
+    """Retrieve relevant documents and generate answer"""
+    
+    # Get collection size
+    try:
+        count = vectorstore._collection.count()
+    except:
+        count = 0
     
     if count == 0:
-        return "❌ No documents indexed. Add PDF/TXT files and click INDEX."
+        return "❌ No documents indexed. Add PDF/TXT files to `./knowledge_base/` and click **INDEX ALL FILES**."
     
-    docs = vectorstore.similarity_search(question, k=min(3, count))
-    st.caption(f"🔍 Found **{len(docs)}** docs")
+    # Search for relevant documents
+    docs = vectorstore.similarity_search(question, k=min(3, max(1, count)))
     
     if not docs:
-        return "No relevant docs found for your question"
+        return "No relevant documents found for your question."
     
-    # Show preview
-    preview = docs[0].page_content[:150] + "..."
-    st.caption(f"**Preview:** {preview}")
-    
-    # Generate answer
+    # Build context from retrieved documents
     context = "\n\n---\n\n".join([d.page_content for d in docs])
+    
+    # Create prompt
     prompt = f"""Based on this context only:
 
 {context}
@@ -89,65 +103,102 @@ Question: {question}
 
 Answer:"""
     
+    # Generate response
     response = llm.invoke(prompt)
     return response.content.strip()
 
-# --- UI ---
-st.set_page_config(layout="wide")
-st.title("📚 Document Chat - INDEX FIRST!")
+# --- STREAMLIT UI ---
+st.set_page_config(layout="wide", page_title="📚 Document Chat")
+st.title("📚 Document Chat")
 
-# Sidebar - MANUAL INDEXING (no watcher issues)
+# Sidebar: File management
 with st.sidebar:
-    st.header("📁 Add Documents")
+    st.header("📁 Manage Documents")
     
-    # File uploader as backup
-    uploaded = st.file_uploader("Or upload here", type=['pdf','txt'])
-    if uploaded:
-        with open(f"{WATCH_PATH}/{uploaded.name}", "wb") as f:
-            f.write(uploaded.getvalue())
-        st.success(f"Saved {uploaded.name}")
-        st.rerun()
+    st.subheader("Upload File")
+    uploaded_file = st.file_uploader(
+        "Choose a PDF or TXT file",
+        type=['pdf', 'txt'],
+        help="Upload a file to add to your knowledge base"
+    )
     
-    # Folder contents
-    files = [f for f in os.listdir(WATCH_PATH) if f.endswith(('.pdf','.txt'))]
-    st.write("**Files:**")
-    for f in files:
-        st.write(f"• {f}")
+    if uploaded_file:
+        try:
+            file_path = WATCH_PATH / uploaded_file.name
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.success(f"✅ Saved: {uploaded_file.name}")
+            st.write(f"📍 Location: `{file_path}`")
+        except Exception as e:
+            st.error(f"Error saving file: {e}")
     
-    # MANUAL INDEX BUTTON
-    if st.button("🔄 INDEX ALL FILES", type="primary"):
-        with st.spinner("Indexing..."):
+    # Show current files
+    st.subheader("Current Files")
+    files = list(WATCH_PATH.glob("*.pdf")) + list(WATCH_PATH.glob("*.txt"))
+    
+    if files:
+        for f in sorted(files):
+            st.write(f"• {f.name}")
+    else:
+        st.info("No files added yet. Upload files above.")
+    
+    # Index button
+    st.subheader("Indexing")
+    if st.button("🔄 INDEX ALL FILES", type="primary", use_container_width=True):
+        with st.spinner("Indexing documents..."):
             result = index_folder()
             st.success(result)
-            st.rerun()
 
-# Main chat
-st.markdown("### 💬 Chat with your documents")
+# Main chat area
+st.markdown("### 💬 Chat with Your Documents")
+
 st.info("""
-1. **Add PDF/TXT** files to `./knowledge_base/` OR upload above
-2. **Click INDEX ALL FILES** 
-3. **Ask questions** about your docs!
+**Getting started:**
+1. Upload PDF/TXT files in the sidebar
+2. Click **INDEX ALL FILES** to process them
+3. Ask questions about your documents below
 """)
 
+# Initialize chat history
 if "history" not in st.session_state:
     st.session_state.history = []
 
+# Display chat history
 for role, content in st.session_state.history:
     with st.chat_message(role):
         st.markdown(content)
 
-prompt = st.chat_input("What do you want to know?")
+# Chat input
+prompt = st.chat_input("What do you want to know about your documents?")
+
 if prompt:
+    # Display user message
     with st.chat_message("user"):
         st.markdown(prompt)
     
+    # Generate and display response
     with st.chat_message("assistant"):
-        response = query_docs(prompt)
+        with st.spinner("Thinking..."):
+            response = query_docs(prompt)
         st.markdown(response)
-        
-        st.session_state.history.append(("user", prompt))
-        st.session_state.history.append(("assistant", response))
+    
+    # Store in history
+    st.session_state.history.append(("user", prompt))
+    st.session_state.history.append(("assistant", response))
 
-if st.button("🗑️ Clear Chat"):
-    st.session_state.history = []
-    st.rerun()
+# Clear chat button
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("🗑️ Clear Chat History", use_container_width=True):
+        st.session_state.history = []
+        st.rerun()
+
+with col2:
+    if st.button("🗑️ Clear All Data", use_container_width=True):
+        st.session_state.history = []
+        # Delete chroma DB
+        import shutil
+        if Path(DB_PATH).exists():
+            shutil.rmtree(DB_PATH)
+        st.success("Database cleared!")
+        st.rerun()
