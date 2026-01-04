@@ -7,34 +7,67 @@ from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- CONFIG ---
-WATCH_PATH = Path("./knowledge_base")  # Convert to Path object
+WATCH_PATH = Path("./knowledge_base")
 DB_PATH = "./chroma_db"
-MODEL_NAME = "qwen3:4b"  
 EMBED_MODEL = "nomic-embed-text:latest"
 
-# Create folder if it doesn't exist
+# Available models for user selection
+AVAILABLE_MODELS = [
+    "qwen3:4b",
+    "qwen2.5-coder:3b"
+]
+
 WATCH_PATH.mkdir(exist_ok=True)
 
 @st.cache_resource
 def setup_rag():
-    """Initialize embeddings and vector store"""
+    """Initialize embeddings and vector store (no LLM here)"""
     embeddings = OllamaEmbeddings(model=EMBED_MODEL)
     
     vectorstore = Chroma(
         persist_directory=str(DB_PATH),
         embedding_function=embeddings,
-        collection_name="documents"  # Named collection
+        collection_name="documents"
     )
     
-    llm = ChatOllama(model=MODEL_NAME, temperature=0.1)
-    return vectorstore, llm
+    return vectorstore
 
-# Load RAG components
-vectorstore, llm = setup_rag()
+vectorstore = setup_rag()
+
+def query_docs(question, model_name):
+    """Retrieve relevant documents and generate answer with selected model"""
+    
+    # Create LLM with user-selected model
+    llm = ChatOllama(model=model_name, temperature=0.1)
+    
+    try:
+        count = vectorstore._collection.count()
+    except:
+        count = 0
+    
+    if count == 0:
+        return "❌ No documents indexed. Add PDF/TXT files to `./knowledge_base/` and click **INDEX ALL FILES**."
+    
+    docs = vectorstore.similarity_search(question, k=min(3, max(1, count)))
+    
+    if not docs:
+        return "No relevant documents found for your question."
+    
+    context = "\n\n---\n\n".join([d.page_content for d in docs])
+    
+    prompt = f"""Based on this context only:
+
+{context}
+
+Question: {question}
+
+Answer:"""
+    
+    response = llm.invoke(prompt)
+    return response.content.strip()
 
 def index_folder():
     """Index all PDF and TXT files in the knowledge base folder"""
-    # Get all PDF and TXT files using Path glob
     pdf_files = list(WATCH_PATH.glob("*.pdf"))
     txt_files = list(WATCH_PATH.glob("*.txt"))
     files = pdf_files + txt_files
@@ -46,7 +79,6 @@ def index_folder():
     
     for file in files:
         try:
-            # Load documents based on file type
             if file.suffix.lower() == '.pdf':
                 loader = PyPDFLoader(str(file))
             else:
@@ -57,14 +89,12 @@ def index_folder():
             if not docs:
                 continue
             
-            # Split documents into chunks
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=800,
                 chunk_overlap=100
             )
             chunks = splitter.split_documents(docs)
             
-            # Add to vector store
             vectorstore.add_documents(chunks)
             total_chunks += len(chunks)
             
@@ -73,45 +103,11 @@ def index_folder():
     
     return f"✅ Indexed {len(files)} files → {total_chunks} chunks"
 
-def query_docs(question):
-    """Retrieve relevant documents and generate answer"""
-    
-    # Get collection size
-    try:
-        count = vectorstore._collection.count()
-    except:
-        count = 0
-    
-    if count == 0:
-        return "❌ No documents indexed. Add PDF/TXT files to `./knowledge_base/` and click **INDEX ALL FILES**."
-    
-    # Search for relevant documents
-    docs = vectorstore.similarity_search(question, k=min(3, max(1, count)))
-    
-    if not docs:
-        return "No relevant documents found for your question."
-    
-    # Build context from retrieved documents
-    context = "\n\n---\n\n".join([d.page_content for d in docs])
-    
-    # Create prompt
-    prompt = f"""Based on this context only:
-
-{context}
-
-Question: {question}
-
-Answer:"""
-    
-    # Generate response
-    response = llm.invoke(prompt)
-    return response.content.strip()
-
 # --- STREAMLIT UI ---
 st.set_page_config(layout="wide", page_title="📚 Document Chat")
 st.title("📚 Document Chat")
 
-# Sidebar: File management
+# Sidebar: File management and model selection
 with st.sidebar:
     st.header("📁 Manage Documents")
     
@@ -132,7 +128,6 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Error saving file: {e}")
     
-    # Show current files
     st.subheader("Current Files")
     files = list(WATCH_PATH.glob("*.pdf")) + list(WATCH_PATH.glob("*.txt"))
     
@@ -142,12 +137,28 @@ with st.sidebar:
     else:
         st.info("No files added yet. Upload files above.")
     
-    # Index button
     st.subheader("Indexing")
     if st.button("🔄 INDEX ALL FILES", type="primary", use_container_width=True):
         with st.spinner("Indexing documents..."):
             result = index_folder()
             st.success(result)
+    
+    # Model selection
+    st.divider()
+    st.subheader("🤖 Model Selection")
+    selected_model = st.selectbox(
+        "Choose a model:",
+        AVAILABLE_MODELS,
+        index=0,
+        help="Select which Ollama model to use for responses"
+    )
+    st.session_state.selected_model = selected_model
+
+# Initialize chat history and model selection
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = AVAILABLE_MODELS[0]
 
 # Main chat area
 st.markdown("### 💬 Chat with Your Documents")
@@ -156,12 +167,9 @@ st.info("""
 **Getting started:**
 1. Upload PDF/TXT files in the sidebar
 2. Click **INDEX ALL FILES** to process them
-3. Ask questions about your documents below
+3. Select a model in the sidebar
+4. Ask questions about your documents below
 """)
-
-# Initialize chat history
-if "history" not in st.session_state:
-    st.session_state.history = []
 
 # Display chat history
 for role, content in st.session_state.history:
@@ -172,17 +180,14 @@ for role, content in st.session_state.history:
 prompt = st.chat_input("What do you want to know about your documents?")
 
 if prompt:
-    # Display user message
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Generate and display response
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            response = query_docs(prompt)
+        with st.spinner(f"Thinking (using {st.session_state.selected_model})..."):
+            response = query_docs(prompt, st.session_state.selected_model)
         st.markdown(response)
     
-    # Store in history
     st.session_state.history.append(("user", prompt))
     st.session_state.history.append(("assistant", response))
 
@@ -196,7 +201,6 @@ with col1:
 with col2:
     if st.button("🗑️ Clear All Data", use_container_width=True):
         st.session_state.history = []
-        # Delete chroma DB
         import shutil
         if Path(DB_PATH).exists():
             shutil.rmtree(DB_PATH)
